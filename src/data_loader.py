@@ -101,3 +101,18 @@ if __name__ == "__main__":
     docs = load_all_documents("data")
     print(f"Loaded {len(docs)} documents.")
     print("Example document:", docs[0] if docs else None)
+
+## surya - Image loading support (CLIP-based, no LLM)
+from langchain_core.documents import Document
+
+def load_images(data_dir: str) -> list:
+    """Load all image paths from the data directory."""
+    data_path = Path(data_dir).resolve()
+    images = []
+    image_extensions = ['*.png', '*.jpg', '*.jpeg']
+    for ext in image_extensions:
+        for img_file in data_path.glob(f'**/{ext}'):
+            print(f"[DEBUG] Found Image: {img_file}")
+            images.append(str(img_file))
+    return images
+## surya end
