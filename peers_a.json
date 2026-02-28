@@ -1,0 +1,12 @@
+{
+    "node_id": "node-a",
+    "port": 8000,
+    "data_dir": "data_a",
+    "faiss_store_dir": "faiss_store_a",
+    "faiss_store_images_dir": "faiss_store_images_a",
+    "peers": [
+        "http://localhost:8001"
+    ],
+    "timeout_seconds": 3,
+    "thumbnail_max_size": [512, 512]
+}

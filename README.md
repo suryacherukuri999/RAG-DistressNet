@@ -1,6 +1,6 @@
 # RAG-DistressNet
 
-A Retrieval-Augmented Generation (RAG) system that supports searching through **PDFs** and **Images** using vector embeddings and LLM-powered answers.
+A Retrieval-Augmented Generation (RAG) system that supports searching through **PDFs** and **Images** using vector embeddings and LLM-powered answers — with **federated search** across multiple nodes.
 
 ## Architecture
 
@@ -16,6 +16,26 @@ Image → CLIP (ViT-L-14) embeds directly → FAISS index
 Query → CLIP embeds text → FAISS retrieves best match → OpenAI LLM describes matched image
 ```
 
+### Federated Pipeline
+```
+User Query
+    │
+    ▼
+Local Node (Coordinator)
+    ├── Search local FAISS index → local results (score, image/chunk)
+    ├── POST /search to Peer B → remote results (score, data)
+    ├── POST /search to Peer C → remote results (score, data)
+    │
+    ▼
+Merge all results by score → pick top-k globally → LLM generates answer
+```
+
+**Image search uses a two-phase approach:**
+1. **Phase 1 (lightweight):** Fan out query to all peers → collect `(score, filename, node_id)` only
+2. **Phase 2 (targeted):** Fetch actual image only from the winning node(s) → single heavy transfer
+
+**PDF search uses single-phase:** Fan out → collect `(score, text_chunk)` → merge and rank.
+
 ## Prerequisites
 
 - **Python 3.11**
@@ -30,40 +50,22 @@ Query → CLIP embeds text → FAISS retrieves best match → OpenAI LLM describ
 > **Important:** Use [Miniforge](https://github.com/conda-forge/miniforge) (ARM-native conda), not Anaconda (x86). Anaconda limits PyTorch to v2.2.2 on Apple Silicon.
 
 ```bash
-# Install Miniforge if not already installed
 brew install miniforge
 /opt/homebrew/Caskroom/miniforge/base/bin/conda init zsh
-# Restart terminal after this
+# Restart terminal
 
-# Optional: install chafa for terminal image display
-brew install chafa
+brew install chafa  # optional
 ```
 
 ### Linux (Ubuntu/Debian)
 
 ```bash
-# Install Miniconda if not already installed
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 bash Miniconda3-latest-Linux-x86_64.sh
 # Follow prompts, restart terminal
 
-# Optional: install chafa for terminal image display
-sudo apt install chafa
+sudo apt install chafa  # optional
 ```
-
-### Linux (Fedora/RHEL)
-
-```bash
-# Install Miniconda if not already installed
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
-# Follow prompts, restart terminal
-
-# Optional: install chafa for terminal image display
-sudo dnf install chafa
-```
-
----
 
 ### Common Setup (Mac & Linux)
 
@@ -81,12 +83,6 @@ conda activate rag
 pip install torch torchvision
 ```
 
-Verify MPS support:
-```bash
-python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
-# Should show: 2.x.x True
-```
-
 **Linux (CPU only):**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -97,19 +93,11 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Verify CUDA support:
-```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-# Should show: 2.x.x True (if GPU available)
-```
-
 #### 3. Install Dependencies
 
 ```bash
 pip install "numpy<2"
 pip install -r requirements.txt
-pip install docx2txt
-pip install langchain-text-splitters
 ```
 
 #### 4. Set Up API Key
@@ -120,101 +108,140 @@ Create a `.env` file in the project root:
 OPENAI_API_KEY=sk-proj-your_actual_key_here
 ```
 
-No quotes needed around the key.
-
 #### 5. Add Your Data
 
-Place your files in the `data/` folder:
+Place your files in the `data/` folder (or `data_a/`, `data_b/` for federation):
 
 ```
 data/
 ├── paper1.pdf
 ├── paper2.pdf
 ├── cat.png
-├── dog.jpeg
-├── diagram.jpg
-└── subfolder/
-    └── more_files_here.pdf
+└── dog.jpeg
 ```
 
-**Supported formats:**
-- **PDFs:** `.pdf`
-- **Text:** `.txt`
-- **CSV:** `.csv`
-- **Excel:** `.xlsx`
-- **Word:** `.docx`
-- **Images:** `.png`, `.jpg`, `.jpeg`
+**Supported formats:** PDF, TXT, CSV, Excel (.xlsx), Word (.docx), PNG, JPG, JPEG
 
 ## Usage
 
-### Search PDFs
+### Local Search (Single Node)
 
 ```bash
+# Search PDFs
 python app.py --pdfs --query "What is attention mechanism?"
-```
 
-Or simply (defaults to PDFs):
-```bash
-python app.py --query "What is attention mechanism?"
-```
-
-First run auto-builds the FAISS index (`faiss_store/`). Subsequent runs load it instantly.
-
-### Search Images
-
-```bash
+# Search images
 python app.py --images --query "Show me the cat"
-python app.py --images --query "a person in suit"
-python app.py --images --query "famous tower"
 ```
 
-First run downloads the CLIP model (~900MB, one time) and builds the image index (`faiss_store_images/`). Subsequent runs load from saved index.
+### Federated Search (Multiple Nodes)
 
-### Rebuild Indexes
-
-After adding new files to `data/`, rebuild the relevant index:
+#### Testing on a Single Machine
 
 ```bash
-# Rebuild image index
-python app.py --images --rebuild --query "your query"
+# 1. Create separate data folders
+bash setup_test.sh
 
-# Rebuild PDF index (delete and re-run)
-rm -rf faiss_store
-python app.py --pdfs --query "your query"
+# 2. Put DIFFERENT files in each
+cp dog.jpg paper1.pdf data_a/
+cp bird.png paper2.pdf data_b/
+
+# 3. Start both servers (separate terminals)
+python -m src.server --config peers_a.json   # port 5000, reads data_a/
+python -m src.server --config peers_b.json   # port 5001, reads data_b/
+
+# 4. Check connectivity
+python app.py --config peers_a.json --discover
+
+# 5. Federated search
+python app.py --config peers_a.json --images --federated --query "bird flying"
+python app.py --config peers_a.json --pdfs --federated --query "attention mechanism"
+```
+
+#### Multiple Machines
+
+Edit `peers_a.json` with actual IPs:
+
+```json
+{
+    "node_id": "node-a",
+    "port": 5000,
+    "data_dir": "data",
+    "faiss_store_dir": "faiss_store",
+    "faiss_store_images_dir": "faiss_store_images",
+    "peers": [
+        "http://192.168.1.10:5000",
+        "http://192.168.1.11:5000"
+    ],
+    "timeout_seconds": 3,
+    "thumbnail_max_size": [512, 512]
+}
+```
+
+**Output shows which node each result came from:**
+```
+Results for: 'laughing dog'
+
+  Image: /tmp/rag_federation/happy_dog.jpg
+  Score: 0.3421  [FROM: node-b]
+  Description: A golden retriever with its mouth open...
+
+  Image: data_a/my_dog.jpg
+  Score: 0.2918  [FROM: node-a]
+  Description: A small poodle playing in a park...
 ```
 
 ## Project Structure
 
 ```
 RAG-DistressNet/
-├── app.py                  # CLI entry point (--pdfs / --images / --rebuild)
+├── app.py                  # CLI entry point (--pdfs / --images / --federated / --discover)
 ├── requirements.txt        # Python dependencies
+├── setup_test.sh           # Helper to create data_a/ and data_b/ for local testing
+├── peers_a.json            # Node A config (port 5000, data_a/)
+├── peers_b.json            # Node B config (port 5001, data_b/)
 ├── .env                    # OpenAI API key (create this)
-├── data/                   # Place PDFs and images here
-├── faiss_store/            # Auto-generated PDF vector index
-├── faiss_store_images/     # Auto-generated image vector index
 └── src/
     ├── __init__.py
+    ├── server.py           # Flask API server (run on each node)
+    ├── federation.py       # Fan-out + score aggregation logic
+    ├── search.py           # RAGSearch + ImageRAGSearch (local & federated)
+    ├── clip_store.py       # CLIP-based vector store for images (ViT-L-14)
     ├── data_loader.py      # Loads PDFs, TXT, CSV, Excel, Word + image paths
     ├── embedding.py        # Text chunking and embedding (all-MiniLM-L6-v2)
-    ├── vectorstore.py      # FAISS vector store for text documents
-    ├── clip_store.py       # CLIP-based vector store for images (ViT-L-14)
-    └── search.py           # RAGSearch (PDFs) + ImageRAGSearch (images)
+    └── vectorstore.py      # FAISS vector store for text documents
 ```
 
-## How It Works
+## How Federation Works
 
-### PDF Search
-1. **Indexing:** PDFs are loaded → split into chunks (1000 chars, 200 overlap) → embedded using `all-MiniLM-L6-v2` → stored in FAISS
-2. **Querying:** Query is embedded → FAISS finds top-k similar chunks → chunks sent as context to OpenAI GPT → LLM generates answer
+### Why Scores Are Comparable
 
-### Image Search
-1. **Indexing:** Images are embedded directly using CLIP (`ViT-L-14`) → stored in FAISS. No LLM needed at index time.
-2. **Querying:** Query text is embedded by CLIP → FAISS finds best matching image(s) → matched image sent to GPT-4o-mini for description
-3. **Matching:** Supports both visual matching (CLIP similarity) and filename matching (e.g., query "prof stoleru" matches `prof_stoleru.jpeg`)
+All nodes use identical models — `ViT-L-14` for images and `all-MiniLM-L6-v2` for text. Since FAISS uses the same distance metric everywhere (`IndexFlatIP` for CLIP cosine similarity, `IndexFlatL2` for text), scores from different nodes are directly comparable and can be merged by simple sorting.
 
-### Why CLIP for Images?
-CLIP understands both images and text in the same vector space. It was trained on 400M image-text pairs, so it knows that an image of a cat and the text "a photo of a cat" are similar — without needing an LLM to describe the image first. This keeps indexing fast, free, and local.
+### Two-Phase Image Search
+
+Transferring full images over HTTP is expensive. The two-phase approach minimizes bandwidth:
+
+1. **Phase 1:** Send only query text → get back `(score, filename)` per result (~100 bytes each)
+2. **Phase 2:** Only fetch the actual image from the node(s) that won the score ranking
+
+This means if your local node has the best match, no images are transferred at all.
+
+### Fault Tolerance
+
+- Peers that timeout or are unreachable are silently skipped
+- Configurable timeout per peer (default: 3s)
+- Local results always available even if all peers are down
+- `--discover` flag lets you check peer status before running queries
+
+## API Endpoints (src/server.py)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/search/images/scores` | POST | Phase 1: return scores + filenames |
+| `/search/images/fetch` | POST | Phase 2: return image as base64 |
+| `/search/pdfs` | POST | Return scores + text chunks |
+| `/health` | GET | Node status + index info |
 
 ## Models Used
 
@@ -224,58 +251,22 @@ CLIP understands both images and text in the same vector space. It was trained o
 | Image Embeddings | `ViT-L-14` via OpenCLIP (~900MB) | Embeds images and query text |
 | LLM | `gpt-4o-mini` (OpenAI API) | Generates answers from retrieved context |
 
-## Dependencies
-
-```
-langchain
-langchain-core
-langchain-community
-langchain-text-splitters
-langchain_openai
-pypdf
-pymupdf
-sentence-transformers
-faiss-cpu
-chromadb
-python-dotenv
-typesense
-langgraph
-Pillow
-open-clip-torch
-docx2txt
-```
-
 ## Troubleshooting
 
+### Federation: peer shows "offline"
+- Make sure `python -m src.server --config <config>.json` is running on the peer
+- Check firewall rules — port must be open
+- Verify the URL is reachable: `curl http://<peer-ip>:<port>/health`
+
+### Federation: scores seem inconsistent
+- All nodes MUST use the same CLIP model (`ViT-L-14`) and text embedding model (`all-MiniLM-L6-v2`)
+- Mixing models makes scores incomparable
+
 ### PyTorch version stuck at 2.2.2 (Mac)
-You're using Intel Anaconda on Apple Silicon. Install Miniforge:
+Use Miniforge instead of Anaconda:
 ```bash
 brew install miniforge
 /opt/homebrew/Caskroom/miniforge/base/bin/conda init zsh
-# Restart terminal
-```
-
-### PyTorch not detecting GPU (Linux)
-Make sure you installed the CUDA version:
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-```
-Check NVIDIA drivers:
-```bash
-nvidia-smi
-```
-
-### `ModuleNotFoundError: No module named 'langchain.text_splitter'`
-```bash
-pip install langchain-text-splitters
-```
-And update import: `from langchain_text_splitters import RecursiveCharacterTextSplitter`
-
-### `ModuleNotFoundError: No module named 'langchain.schema'`
-Use updated imports:
-```python
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
 ```
 
 ### NumPy 2.x compatibility error
@@ -288,31 +279,6 @@ pip install "numpy<2"
 pip uninstall faiss-cpu -y
 conda install -c conda-forge faiss-cpu -y
 ```
-
-### Segmentation fault with FAISS (Linux)
-```bash
-pip uninstall faiss-cpu -y
-pip install faiss-cpu --force-reinstall --no-cache-dir
-```
-
-### `open` command not found for images (Linux)
-The `open` command is Mac-only. On Linux, use `xdg-open` instead. In `app.py`, change:
-```python
-subprocess.run(["open", img["path"]])
-```
-to:
-```python
-subprocess.run(["xdg-open", img["path"]])
-```
-Or use `chafa` for terminal display (works on both Mac and Linux):
-```python
-subprocess.run(["chafa", "--size=40x20", img["path"]])
-```
-
-### CLIP not matching "human" or "person" correctly
-The ViT-L-14 model works best with descriptive queries. Try:
-- `"a person in suit"` instead of `"human"`
-- `"man portrait photo"` instead of `"person"`
 
 ## License
 
